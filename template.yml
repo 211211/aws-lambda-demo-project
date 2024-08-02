@@ -1,0 +1,2483 @@
+# This is the SAM template that represents the architecture of your serverless application
+# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-template-basics.html
+
+# The AWSTemplateFormatVersion identifies the capabilities of the template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/format-version-structure.html
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  SAM-Test
+
+# Transform section specifies one or more macros that AWS CloudFormation uses to process your template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/transform-section-structure.html
+Transform:
+  - AWS::Serverless-2016-10-31
+
+Conditions:
+  IsInipDev:
+    !Equals [!Sub "${AWS::StackName}", "INIP-DEV"]
+  IsInipInt:
+    !Equals [!Sub "${AWS::StackName}", "INIP-INT"]
+  IsInipPrd:
+    !Equals [!Sub "${AWS::StackName}", "INIP-PRD"]
+  AddCustomDomain: !Or [Condition: IsInipDev, Condition: IsInipInt, Condition: IsInipPrd]
+  NoCustomDomain: !Not [Condition: AddCustomDomain]
+
+Mappings:
+  AvisSchdulerBucket:
+    "INIP-DEV":
+      bucketname: inip-dev-avis-bucket
+    "INIP-INT":
+      bucketname: inip-int-avis-bucket
+    "INIP-PRD":
+      bucketname: inip-prd-avis-bucket
+    "INIP-dry-run":
+      bucketname: inip-dry-run-avis-bucket
+  NotificationData:
+    "INIP-DEV":
+      Domain: "dev.inip.productlake.galeria.de"
+      Cert: "arn:aws:acm:eu-central-1:705229686812:certificate/c187bf53-b612-49e1-9891-ee2debc12a61"
+    "INIP-INT":
+      Domain: "int.inip.productlake.galeria.de"
+      Cert: "arn:aws:acm:eu-central-1:705229686812:certificate/7d4a1652-47d5-44c5-9e74-8bb86cd35ffa"
+    "INIP-PRD":
+      Domain: "inip.productlake.galeria.de"
+      Cert: "arn:aws:acm:eu-central-1:919884659465:certificate/4649cf4d-c73b-49d3-b780-53d3a0975ce8"
+
+Globals:
+  Function:
+    Layers:
+      - !Ref RuntimeDependenciesLayer
+      # Enable Lambda insight for all lambda functions
+      # https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Lambda-Insights-extension-versions.html
+      - !Sub "arn:aws:lambda:eu-central-1:580247275435:layer:LambdaInsightsExtension:14"
+    Environment:
+      # Environment variables used by every function
+      Variables:
+        StackName: !Sub "${AWS::StackName}"
+        ENVIRONMENT: development
+    Runtime: nodejs14.x
+    MemorySize: 128
+    Timeout: 100
+
+# Resources declares the AWS resources that you want to include in the stack
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resources-section-structure.html
+Resources:
+  SAMLogs:
+    Type: AWS::Logs::LogGroup
+
+  SMResubscribe:
+    Type: AWS::Serverless::StateMachine # More info about State Machine Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html
+    Properties:
+      DefinitionUri: statemachine/subscribe.asl.json
+      DefinitionSubstitutions:
+        SubscribeFunctionArn: !GetAtt RequestSubscription.Arn
+        # DDBPutItem: !Sub arn:${AWS::Partition}:states:::dynamodb:putItem
+        # DDBTable: !Ref TransactionTable
+      Events:
+        ResubscribeScedule:
+          Type: Schedule # More info about Schedule Event Source: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-property-statemachine-statemachineschedule.html
+          Properties:
+            Description: Schedule to re-subscribe every 11 Hours
+            Enabled: False # enable this manually to prevent high costs on migrations
+            Schedule: "rate(11 hours)" # https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-schedule-expressions.html
+      Policies: # Find out more about SAM policy templates: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-policy-templates.html
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RequestSubscription
+        # - DynamoDBWritePolicy:
+        #     TableName: !Ref TransactionTable
+  RequestSubscription:
+    Description: Is called via the SMResubscribe Stepfunction to re-subscribe on the notifications
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ReqSub.reqSubHandler
+      Environment:
+        Variables:
+          NOTIFICATION_ENDPOINT: !If
+          - AddCustomDomain
+          - !Sub "https://${NotificationAPIWithDomain}.execute-api.${AWS::Region}.amazonaws.com/v1"
+          - !Sub "https://${NotificationAPI}.execute-api.${AWS::Region}.amazonaws.com/v1"
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  SMProcessMessage:
+    Type: AWS::Serverless::StateMachine # More info about State Machine Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html
+    Properties:
+      DefinitionUri: statemachine/processMessage.asl.json
+      DefinitionSubstitutions:
+        ParseIncomingMessageFunctionArn: !GetAtt ParseIncomingMessage.Arn
+
+        # Message Handling
+        ConfirmSubscriptionFunctionArn: !GetAtt ConfirmSubscription.Arn
+        FetchArticleFunctionArn: !GetAtt FetchArticle.Arn
+        FetchImagesFunctionArn: !GetAtt FetchImages.Arn
+        FetchProductFunctionArn: !GetAtt FetchProduct.Arn
+        FetchvvBFunctionArn: !GetAtt FetchvvB.Arn
+        FetchSizemappingFunctionArn: !GetAtt FetchSizemapping.Arn
+        CreateTaskArn: !GetAtt CreateTask.Arn
+        CheckIsBlockedFunctionArn: !GetAtt CheckIsBlocked.Arn
+        UpdateSeenSizesFunctionArn: !GetAtt UpdateSeenSizesOfSizeMappings.Arn
+        ProcessGatheringResultsFunctionArn: !GetAtt ProcessGatheringResults.Arn
+        LogProductStatusFunctionArn: !GetAtt LogProductStatus.Arn
+        ProcessHotFunctionArn: !GetAtt ProcessHot.Arn
+        PrepareFMAFunctionArn: !GetAtt PrepareFMA.Arn
+        PrepareHotFMAFunctionArn: !GetAtt PrepareHotFMA.Arn
+        CreateFMAFunctionArn: !GetAtt CreateFMA.Arn
+        AskUserFunctionArn: !GetAtt AskUser.Arn
+        SendOrderExportArn: !GetAtt SendOrderExport.Arn
+        ParseOrderExportResponseArn: !GetAtt ParseOrderExportResponse.Arn
+        StoreSentFmaRequestArn: !GetAtt StoreSentFmaRequest.Arn
+        ProcessReplyFromSAPArn: !GetAtt ProcessReplyFromSAP.Arn
+        CreateManualFmaArn: !GetAtt CreateManualFma.Arn
+
+        # Error Handling
+        UnknownMessageFunctionArn: !GetAtt UnknownMessage.Arn
+
+        # Other Stuff
+        Table-Mutex: !Ref TableSMProcessMessageMutex
+        Table-WaitUntil: !Ref TableSMProcessMessageWaitUntil
+        Table-State: !Ref TableState
+        Queue-KorexOrderExprt: !Ref KorexOrderExprtCallbackQueue
+        Queue-PhotoSampleRequest: !Ref SapPhotoSampleCallbackQueue
+      Logging:
+        Level: ALL # TODO: change to FATAL for production - https://docs.aws.amazon.com/step-functions/latest/dg/cloudwatch-log-level.html
+        IncludeExecutionData: True
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt SAMLogs.Arn
+      Policies: # Find out more about SAM policy templates: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-policy-templates.html
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ParseIncomingMessage
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ConfirmSubscription
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchArticle
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchImages
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchProduct
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchvvB
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchSizemapping
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CreateTask
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckIsBlocked
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UpdateSeenSizesOfSizeMappings
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessGatheringResults
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LogProductStatus
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessHot
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PrepareFMA
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PrepareHotFMA
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CreateFMA
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UpdateSeenSizesOfSizeMappings
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AskUser
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessReplyFromSAP
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UnknownMessage
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SendOrderExport
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ParseOrderExportResponse
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CreateManualFma
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSMProcessMessageMutex
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSMProcessMessageWaitUntil
+        - CloudWatchLogsFullAccess # TODO: restrict this Policy to only grant write access - https://aws.amazon.com/de/premiumsupport/knowledge-center/lambda-sam-template-permissions/
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt KorexOrderExprtCallbackQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SapPhotoSampleCallbackQueue.QueueName
+  TableSMProcessMessageMutex:
+    Type: AWS::Serverless::SimpleTable
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-SMProcessMessage-Mutex"
+      PrimaryKey:
+          Name: lockName
+          Type: String
+  TableSMProcessMessageWaitUntil:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-SMProcessMessage-WaitUntil"
+      AttributeDefinitions:
+        - AttributeName: execId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: execId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  NotificationAPI:
+    Type: AWS::Serverless::Api
+    Condition: NoCustomDomain
+    Properties:
+      StageName: v1
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: !Sub "${AWS::StackName}-NotificationAPI"
+          version: "1.0"
+        paths:
+          /postmessage:
+            post:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials: !GetAtt RoleInvokeStepfunction.Arn
+                uri: "arn:aws:apigateway:eu-central-1:states:action/StartExecution"
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                requestTemplates:
+                  application/json: !Join [ "", [ "{\"input\": \"$util.escapeJavaScript($input.json('$'))\"\
+                    , \"stateMachineArn\": \"",
+                    !GetAtt SMProcessMessage.Arn,
+                    "\"}\n"] ]
+                  text/plain: !Join [ "", [ "{\"input\": \"$util.escapeJavaScript($input.json('$'))\"\
+                    , \"stateMachineArn\": \"",
+                    !GetAtt SMProcessMessage.Arn,
+                    "\"}\n"] ]
+                passthroughBehavior: "when_no_match"
+                type: "aws"
+          /SAP/MusterAnforderung/callback:
+            post:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiPostSapPhotoSampleRequestCallbackHandler.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+          /korex/orderexport/callback:
+            post:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiPostKorexOrderExportCallbackHandler.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+          /identifiers:
+            get:
+              parameters:
+                - in: query
+                  name: startDate
+                  schema:
+                    type: string
+                  required: true
+                - in: query
+                  name: endDate
+                  schema:
+                    type: string
+                  required: true
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiGetIdentifiers.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+          '/identifiers/{identifier}':
+            get:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiGetSingleIdentifier.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+
+  NotificationAPIWithDomain:
+    Type: AWS::Serverless::Api
+    Condition: AddCustomDomain
+    Properties:
+      StageName: v1
+      Domain:
+        BasePath: inip
+        SecurityPolicy: TLS_1_2
+        CertificateArn: !FindInMap [NotificationData, !Ref "AWS::StackName", "Cert"]
+        DomainName: !FindInMap [NotificationData, !Ref "AWS::StackName", "Domain"]
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: !Sub "${AWS::StackName}-NotificationAPI"
+          version: "1.0"
+        paths:
+          /postmessage:
+            post:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials: !GetAtt RoleInvokeStepfunction.Arn
+                uri: "arn:aws:apigateway:eu-central-1:states:action/StartExecution"
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                requestTemplates:
+                  application/json: !Join [ "", [ "{\"input\": \"$util.escapeJavaScript($input.json('$'))\"\
+                    , \"stateMachineArn\": \"",
+                    !GetAtt SMProcessMessage.Arn,
+                    "\"}\n"] ]
+                  text/plain: !Join [ "", [ "{\"input\": \"$util.escapeJavaScript($input.json('$'))\"\
+                    , \"stateMachineArn\": \"",
+                    !GetAtt SMProcessMessage.Arn,
+                    "\"}\n"] ]
+                passthroughBehavior: "when_no_match"
+                type: "aws"
+          /SAP/MusterAnforderung/callback:
+            post:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiPostSapPhotoSampleRequestCallbackHandler.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+          /korex/orderexport/callback:
+            post:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiPostKorexOrderExportCallbackHandler.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+          /identifiers:
+            get:
+              parameters:
+                - in: query
+                  name: startDate
+                  schema:
+                    type: string
+                  required: true
+                - in: query
+                  name: endDate
+                  schema:
+                    type: string
+                  required: true
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiGetIdentifiers.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+          '/identifiers/{identifier}':
+            get:
+              responses:
+                "400":
+                  description: "400 response"
+                  content: {}
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                credentials:
+                  'Fn::Sub': '${RoleInvokeLambdafunction.Arn}'
+                uri:
+                  'Fn::Sub': 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiGetSingleIdentifier.Arn}/invocations'
+                responses:
+                  "200":
+                    statusCode: "200"
+                  "400":
+                    statusCode: "400"
+                type: "aws_proxy"
+  RoleInvokeStepfunction:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SMProcessMessageApiRoleStartExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'states:StartExecution'
+              # Resource: !GetAtt SMProcessMessage.Arn
+              Resource: !Ref SMProcessMessage
+  RoleInvokeLambdafunction:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: RoleInvokeLambdafunction
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "lambda:InvokeFunction"
+            - "lambda:InvokeAsync"
+            Resource:
+                - !GetAtt NotImplemented.Arn
+                - !GetAtt ApiPostKorexOrderExportCallbackHandler.Arn
+                - !GetAtt ApiPostSapPhotoSampleRequestCallbackHandler.Arn
+                - !GetAtt ApiGetIdentifiers.Arn
+                - !GetAtt ApiGetSingleIdentifier.Arn
+
+  LoweredCaseStackName:
+    Type: Custom::Lowercase
+    Properties:
+      ServiceToken: !GetAtt LowerCaseLambda.Arn
+      InputString: !Sub "${AWS::StackName}"
+
+  # Each Lambda function is defined by properties:
+  # https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+  ParseIncomingMessage:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ParseIncomingMessage.parseIncomingMessageHandler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  UnknownMessage:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/UnknownMessage.unknownMessageHandler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  ConfirmSubscription:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ConfirmSubscription.confirmSubscriptionHandler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  FetchArticle:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/FetchArticle.fetchArticleHandler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  FetchImages:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/FetchImages.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  FetchProduct:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/FetchProduct.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  FetchvvB:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/FetchvvB.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  FetchSizemapping:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/FetchSizemapping.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSectorMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+
+  CreateTask:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/CreateTask.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableOpenTasks
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSectorMapping
+
+  CheckIsBlocked:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/CheckIsBlocked.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableGtinBlocks
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  UpdateSeenSizesOfSizeMappings:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/UpdateSeenSizesOfSizeMapping.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+
+  ProcessGatheringResults:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ProcessGatheringResults.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLimits
+
+  LogProductStatus:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/LogProductStatus.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  ProcessHot:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ProcessHot.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  PrepareFMA:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PrepareFMA.handlerNormal
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+  PrepareHotFMA:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PrepareFMA.handlerHot
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+  CreateFMA:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/CreateFMA.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  AskUser:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/AskUser.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  SendOrderExport:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SendOrderExport.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  ParseOrderExportResponse:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ParseOrderExportResponse.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  CreateManualFma:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/CreateManualFma.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+
+  NotImplemented:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/NotImplemented.notImplemetedHandler
+  
+  WorkbenchImporterAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-workbench-importer-api"
+      StageName: v1
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: api/workbenchImporter.yml
+      Auth:
+        ApiKeyRequired: true
+
+  WorkbenchPhotoStudioReceiptAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-workbench-photostudio-receipt-api"
+      StageName: v1
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: api/workbenchPhotoStudioReceipt.yml
+      Auth:
+        ApiKeyRequired: true
+
+  WorkbenchAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-workbench-api"
+      StageName: v1
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: api/workbench.yml
+      Auth:
+        DefaultAuthorizer: WorkbenchApiAuthorizer
+        Authorizers:
+          WorkbenchApiAuthorizer:
+            UserPoolArn: !GetAtt GkkCognitoUserPool.Arn
+  OELWorkbenchAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-oel-workbench-api"
+      StageName: v1
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: api/oelWorkbench.yml
+      Auth:
+        ApiKeyRequired: true
+
+  OELWorkbenchAPIInvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: InvokeOelWorkbenchAPILambdas
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "lambda:InvokeFunction"
+            - "lambda:InvokeAsync"
+            Resource:
+                - !GetAtt ApiImportOELProductHandler.Arn
+
+  WorkbenchAPIInvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: InvokeWorkbenchAPILambdas
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "lambda:InvokeFunction"
+            - "lambda:InvokeAsync"
+            Resource:
+                - !GetAtt NotImplemented.Arn
+                - !GetAtt ApiAllPhotoStudioAssignmentsHandler.Arn
+                - !GetAtt ApiPutSinglePhotoStudioAssignmentsHandler.Arn
+                - !GetAtt ApiInitMappingTablesDataHandler.Arn
+                - !GetAtt ApiAllConsumptionFieldsHandler.Arn
+                - !GetAtt ApiAllSectorsHandler.Arn
+                - !GetAtt ApiPutSingleSectorHandler.Arn
+                - !GetAtt ApiAllConsumptionThemesHandler.Arn
+                - !GetAtt ApiAllBrandsHandler.Arn
+                - !GetAtt ApiSingleBrandHandler.Arn
+                - !GetAtt ApiPutSingleBrandHandler.Arn
+                - !GetAtt ApiDeleteSingleBrandHandler.Arn
+                - !GetAtt ApiAllSizeMappingsHandler.Arn
+                - !GetAtt ApiGetSingleSizeMappingHandler.Arn
+                - !GetAtt ApiPutSingleSizeMappingHandler.Arn
+                - !GetAtt ApiDeleteSizeMappingsHandler.Arn
+                - !GetAtt ApiInitSizeMappingDataHandler.Arn
+                - !GetAtt ApiGetExpiredImagesByConditionHandler.Arn
+                - !GetAtt ApiGetAllPhotostudiosHandler.Arn
+                - !GetAtt ApiPutSinglePhotostudioHandler.Arn
+                - !GetAtt ApiDeleteSinglePhotostudioHandler.Arn
+                - !GetAtt ApiPostAskUserCompleteHandler.Arn
+                - !GetAtt ApiGetAllOpenTasksHandler.Arn
+                - !GetAtt ApiDeleteSingleOpenTaskHandler.Arn
+                - !GetAtt ApiGetAllProcurementsHandler.Arn
+                - !GetAtt ApiGetSingleProcurementByIdHandler.Arn
+                - !GetAtt ApiPostManualHqFmaByGtin.Arn
+                - !GetAtt ApiGetAllNewManualHqFmasByType.Arn
+                - !GetAtt ApiPostFinalizePackage.Arn
+                - !GetAtt ApiDeleteGtinFromPackage.Arn
+                - !GetAtt ApiPostGtinArrivesPhotoStudio.Arn
+                - !GetAtt ApiPostGtinLeavesPhotoStudio.Arn
+  ApiAllPhotoStudioAssignmentsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/KtAssignmentHandlers.getAllPhotoStudioAssignments
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        # Give Create/Read/Update/Delete Permissions to the TablePhotoStudioAssignments
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+
+  ApiPutSinglePhotoStudioAssignmentsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/KtAssignmentHandlers.putSinglePhotoStudioAssignments
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+
+  ApiInitMappingTablesDataHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/KtAssignmentHandlers.initKtAssignmentData
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSectorMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionFieldMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+
+  ApiAllConsumptionFieldsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/KtAssignmentHandlers.getAllConsumptionFields
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionFieldMapping
+
+  ApiAllSectorsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SectorHandlers.getAllSectors
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSectorMapping
+
+  ApiPutSingleSectorHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SectorHandlers.putSingleSector
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSectorMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionFieldMapping
+
+  ApiAllConsumptionThemesHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/KtAssignmentHandlers.getAllConsumptionThemes
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+
+  ApiAllBrandsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/BrandHandlers.getAllBrands
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+
+  ApiSingleBrandHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/BrandHandlers.getSingleBrand
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+
+  ApiPutSingleBrandHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/BrandHandlers.putSingleBrand
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+
+  ApiDeleteSingleBrandHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/BrandHandlers.deleteSingleBrand
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+
+  ApiAllSizeMappingsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SizeMappingHandlers.getAllSizeMappings
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+  
+  ApiGetSingleSizeMappingHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SizeMappingHandlers.getSingleSizeMapping
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+
+  ApiPutSingleSizeMappingHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SizeMappingHandlers.putSingleSizeMapping
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+
+  ApiDeleteSizeMappingsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SizeMappingHandlers.deleteSizeMapping
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+
+  ApiInitSizeMappingDataHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SizeMappingHandlers.initSizeMappingData
+      Timeout: 29
+      MemorySize: 512
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+
+  ApiGetExpiredImagesByConditionHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ExpiredImagesHandlers.getDataByCondition
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  ApiGetAllPhotostudiosHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PhotostudioHandlers.getAllPhotostudios
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+
+  ApiPutSinglePhotostudioHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PhotostudioHandlers.putSinglePhotostudio
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+
+  ApiDeleteSinglePhotostudioHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PhotostudioHandlers.deleteSinglePhotostudio
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+
+  ApiPostAskUserCompleteHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/AskUser.updateAskUserDecision
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  ApiGetAllOpenTasksHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/OpenTaskHandlers.getAllOpenTasks
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableOpenTasks
+
+  ApiDeleteSingleOpenTaskHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/OpenTaskHandlers.deleteSingleOpenTask
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableOpenTasks
+
+  ApiGetAllProcurementsHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ProcurementHandlers.getAllProcurements
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  ApiGetSingleProcurementByIdHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ProcurementHandlers.getSingleProcurementById
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  ApiPostManualHqFmaByGtin:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ManualHqFmasHandlers.getDestinationLocationIdByGtin
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableConsumptionTheme
+  
+  ApiGetAllNewManualHqFmasByType:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ManualHqFmasHandlers.getAllNewManualHqFmasByType
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+
+  ApiDeleteGtinFromPackage:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ManualHqFmasHandlers.deleteGtinFromPackage
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+
+  ApiPostFinalizePackage:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ManualHqFmasHandlers.postFinalizePackage
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+
+  # Workbench PhotoStudio Receipt
+  ApiPostGtinArrivesPhotoStudio:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PhotoStudioReceiptHandlers.gtinArrivedPhotoStudio
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+
+  ApiPostGtinLeavesPhotoStudio:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/PhotoStudioReceiptHandlers.gtinLeftPhotoStudio
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudios
+
+  ApiGetIdentifiers:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/IdentifiersHandlers.getAllIdentifiers
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+
+  ApiGetSingleIdentifier:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/IdentifiersHandlers.getSingleIdentifier
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+
+
+  # Shared layer with Lambda runtime dependencies
+  RuntimeDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Description: Runtime dependencies for Lambdas
+      ContentUri: ./
+      CompatibleRuntimes:
+        - nodejs14.x
+      RetentionPolicy: Retain
+
+  TableState:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-state"
+      AttributeDefinitions:
+        - AttributeName: identifier
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: storeId
+          AttributeType: S
+        - AttributeName: fmaRequestId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: identifier
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: "idx_status_timestamp"
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_storeId_status"
+          KeySchema:
+            - AttributeName: storeId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_fmaRequestId_status"
+          KeySchema:
+            - AttributeName: fmaRequestId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_identifier_status"
+          KeySchema:
+            - AttributeName: identifier
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableStateStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableState.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableLatestState:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-latest-state"
+      AttributeDefinitions:
+        - AttributeName: identifier
+          AttributeType: S
+        - AttributeName: destinationLocationId
+          AttributeType: S
+        - AttributeName: fmaRequestId
+          AttributeType: S
+        - AttributeName: storeId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: gtin
+          AttributeType: S
+        - AttributeName: procurementStartedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: identifier
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: "idx_destinationLocationId_identifier"
+          KeySchema:
+            - AttributeName: destinationLocationId
+              KeyType: HASH
+            - AttributeName: identifier
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_status_identifier" #TODO: remove this redundant index later
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: identifier
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_status_timestamp"
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_fmaRequestId"
+          KeySchema:
+            - AttributeName: fmaRequestId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_storeId_status"
+          KeySchema:
+            - AttributeName: storeId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_destinationLocationId_status"
+          KeySchema:
+            - AttributeName: destinationLocationId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_gtin_status"
+          KeySchema:
+            - AttributeName: gtin
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: "idx_status_procurementStartedAt"
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: procurementStartedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableLatestStateStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableLatestState.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+  TableLatestStateStreamToSplunk:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableLatestState.StreamArn
+      FunctionName: !GetAtt SplunkMigrating.Arn
+      StartingPosition: LATEST
+
+  TablePhotoStudioAssignments:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-photoassignments"
+      AttributeDefinitions:
+        - AttributeName: consumptionTheme
+          AttributeType: N
+      KeySchema:
+        - AttributeName: consumptionTheme
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TablePhotoStudioAssignmentsStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TablePhotoStudioAssignments.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableConsumptionTheme:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-consumptionthememapping"
+      AttributeDefinitions:
+        - AttributeName: consumptionTheme
+          AttributeType: N
+      KeySchema:
+        - AttributeName: consumptionTheme
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableConsumptionThemeStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableConsumptionTheme.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableSectorMapping:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-sectormapping"
+      AttributeDefinitions:
+        - AttributeName: sector
+          AttributeType: N
+      KeySchema:
+        - AttributeName: sector
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableSectorMappingStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableSectorMapping.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableConsumptionFieldMapping:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-consumptionfieldmapping"
+      AttributeDefinitions:
+        - AttributeName: consumptionField
+          AttributeType: N
+      KeySchema:
+        - AttributeName: consumptionField
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableConsumptionFieldMappingStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableConsumptionFieldMapping.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableSizeMapping:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-sizemappings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: _id
+          AttributeType: S
+        - AttributeName: consumptionTheme
+          AttributeType: N
+        - AttributeName: brand
+          AttributeType: S
+      KeySchema:
+        - AttributeName: _id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: "idx_consumptionTheme_brand"
+          KeySchema:
+            - AttributeName: consumptionTheme
+              KeyType: HASH
+            - AttributeName: brand
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableSizeMappingStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableSizeMapping.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableBrands:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-brands"
+      AttributeDefinitions:
+        - AttributeName: brand
+          AttributeType: S
+      KeySchema:
+        - AttributeName: brand
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableBrandsStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableBrands.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TablePhotoStudios:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-photostudiosupdated"
+      AttributeDefinitions:
+        - AttributeName: photostudio
+          AttributeType: S
+      KeySchema:
+        - AttributeName: photostudio
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TablePhotoStudiosStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TablePhotoStudios.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableKorexOrderExportMapping:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-korexorderexportmapping"
+      AttributeDefinitions:
+        - AttributeName: orderExportGtin
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderExportGtin
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableKorexOrderExportMappingStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableKorexOrderExportMapping.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableFmaRequestMapping:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-fmarequestmapping"
+      AttributeDefinitions:
+        - AttributeName: fmaRequestId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fmaRequestId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableFmaRequestMappingStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableFmaRequestMapping.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableGtinBlocks:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-gtinblocks"
+      AttributeDefinitions:
+        - AttributeName: gtin
+          AttributeType: S
+        - AttributeName: blockedUntil
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gtin
+          KeyType: HASH
+        - AttributeName: blockedUntil
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableGtinBlocksStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableGtinBlocks.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableOpenTasks:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-opentasksnew"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: _id
+          AttributeType: S
+        - AttributeName: type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: _id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: "idx_type"
+          KeySchema:
+            - AttributeName: type
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableOpenTasksStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableOpenTasks.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+
+  TableLimits:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-limits"
+      AttributeDefinitions:
+        - AttributeName: day
+          AttributeType: S
+      KeySchema:
+        - AttributeName: day
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  TableLimitsStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      MaximumRetryAttempts: 1
+      EventSourceArn: !GetAtt TableLimits.StreamArn
+      FunctionName: !GetAtt ElsMigrating.Arn
+      StartingPosition: LATEST
+  TableOELData:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-oeldata"
+      AttributeDefinitions:
+        - AttributeName: gtin
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gtin
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Process DB changes and update to OpenSearch
+  ElsMigrating:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ElsMigrating.handler
+      Role: !GetAtt ElsMigratingRole.Arn
+      Environment:
+        Variables:
+          ELASTICSEARCH_ENDPOINT: 
+            !Sub
+              - 'https://${ElasticsearchDomain}'
+              - { ElasticsearchDomain: !GetAtt ElasticsearchDomain.DomainEndpoint }
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  ElsMigratingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        # Allow Lambda to assume this role
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: ElsMigratingRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            # Allow Lambda to write logs to CloudWatch
+            - Effect: Allow
+              Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: arn:aws:logs:*:*:*
+            # Allow Lambda to read from the DynamoDB stream
+            - Effect: Allow
+              Action:
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+              - dynamodb:ListStreams
+              Resource: "*"
+
+  # Process DB changes and update to Splunk
+  SplunkMigrating:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SplunkMigrating.handler
+      Role: !GetAtt SplunkMigratingRole.Arn
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+
+  SplunkMigratingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        # Allow Lambda to assume this role
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: SplunkMigratingRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            # Allow Lambda to write logs to CloudWatch
+            - Effect: Allow
+              Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: arn:aws:logs:*:*:*
+            # Allow Lambda to read from the DynamoDB stream
+            - Effect: Allow
+              Action:
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+              - dynamodb:ListStreams
+              Resource: "*"
+  # Process SAP photo sample request
+  ApiPostSapPhotoSampleRequestCallbackHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/SapPhotoSampleRequestCallbackHandlers.processSapPhotoSampleRequestCallback
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - SQSPollerPolicy:
+            QueueName:
+              !GetAtt SapPhotoSampleCallbackQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableFmaRequestMapping
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+              Resource: !GetAtt SMProcessMessage.Arn
+  StoreSentFmaRequest:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/StoreSentFmaRequest.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - SQSPollerPolicy:
+            QueueName:
+              !GetAtt SapPhotoSampleCallbackQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableFmaRequestMapping
+      Events:
+        SapPhotoSampleCallbackEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SapPhotoSampleCallbackQueue.Arn
+            BatchSize: 10
+  ProcessReplyFromSAP:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ProcessReplyFromSAP.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableState
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableLatestState
+  SapPhotoSampleCallbackQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 100
+
+  # Process Korex order export callback
+  ApiPostKorexOrderExportCallbackHandler:
+    Description: Receive HTTP Requests
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/KorexOrderExportCallbackHandler.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableKorexOrderExportMapping
+        - SQSPollerPolicy:
+            QueueName:
+              !GetAtt KorexOrderExprtCallbackQueue.QueueName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+              Resource: !GetAtt SMProcessMessage.Arn
+  StoreSentKorexOrderExport:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/StoreSentKorexOrderExport.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - SQSPollerPolicy:
+            QueueName:
+              !GetAtt KorexOrderExprtCallbackQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableKorexOrderExportMapping
+      Events:
+        SapPhotoSampleCallbackEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt KorexOrderExprtCallbackQueue.Arn
+            BatchSize: 10
+  KorexOrderExprtCallbackQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 100
+
+  # Cognito and user pool
+  LowerCaseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "lambda-write-logs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*"
+
+  LowerCaseLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Returns the lowercase version of a string
+      MemorySize: 256
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt LowerCaseLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import cfnresponse
+
+          def lambda_handler(event, context):                                                    
+              output = event['ResourceProperties'].get('InputString', '').lower()                
+              responseData = {'OutputString': output}                                            
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+  
+  UserPoolDomailName:
+    Type: Custom::Lowercase
+    Properties:
+      ServiceToken: !GetAtt LowerCaseLambda.Arn
+      InputString: !Sub "${AWS::StackName}-auth"
+
+  GkkCognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-UserPool"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+      UsernameConfiguration:
+        CaseSensitive: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+  WorbenchApiCognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !GetAtt UserPoolDomailName.OutputString
+      UserPoolId: !Ref GkkCognitoUserPool
+  
+  WorkbenchApiCognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref GkkCognitoUserPool
+      ClientName: !Sub "${AWS::StackName}-WorkbenchApiCognitoUserPoolClient"
+      GenerateSecret: true
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - phone
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      CallbackURLs:
+        - gkkinipapp://      #Fotomuster Workbench (INIP) 
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlowsUserPoolClient: true
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      TokenValidityUnits:
+        AccessToken: "hours"
+        IdToken: "hours"
+
+  PhotoFlowCognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref GkkCognitoUserPool
+      ClientName: !Sub "${AWS::StackName}-PhotoFlowCognitoUserPoolClient"
+      GenerateSecret: true
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - phone
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      CallbackURLs:
+        - gkkfotoflowapp://  #FotoFlow
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlowsUserPoolClient: true
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      TokenValidityUnits:
+        AccessToken: "hours"
+        IdToken: "hours"
+
+  ImageEditingUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref GkkCognitoUserPool
+      ClientName: !Sub "${AWS::StackName}-ImageEditingUserPoolClient"
+      GenerateSecret: true
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - phone
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      CallbackURLs:
+        - gkkiewbapp://      #ImageEditing Workbench
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlowsUserPoolClient: true
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      TokenValidityUnits:
+        AccessToken: "hours"
+        IdToken: "hours"
+
+  ArticleWorkbenchUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref GkkCognitoUserPool
+      ClientName: !Sub "${AWS::StackName}-ArticleWorkbenchUserPoolClient"
+      GenerateSecret: true
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - phone
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      CallbackURLs:
+        - gkkarticlewbapp:// #Article Workbench 
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlowsUserPoolClient: true
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      TokenValidityUnits:
+        AccessToken: "hours"
+        IdToken: "hours"
+  # Just a simple config for OpenSearch domain
+  ElasticsearchDomainName:
+    Type: Custom::Lowercase
+    Properties:
+      ServiceToken: !GetAtt LowerCaseLambda.Arn
+      InputString: !Sub "${AWS::StackName}-els"
+
+  ElasticsearchDomain:
+    Type: 'AWS::Elasticsearch::Domain'
+    Properties:
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: "*"
+          Action:
+          - 'es:*'
+          Resource: 
+            !Sub
+             - 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElsDomainName}/*'
+             - { ElsDomainName: !GetAtt ElasticsearchDomainName.OutputString }
+      DomainName: !GetAtt ElasticsearchDomainName.OutputString
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+        VolumeType: gp2
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: 'admin' #TODO: save this somewhere else and not push to git
+          MasterUserPassword: ',Re7J]7<M3-AU*F{'
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: 10
+      ElasticsearchVersion: '7.10'
+    UpdatePolicy:
+      EnableVersionUpgrade: true
+
+  # Cron job for checking OpenTasks everyday
+  CheckingOpenTaskLambdaFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/CheckingOpenTasks.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableOpenTasks
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableBrands
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TablePhotoStudioAssignments
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSectorMapping
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSizeMapping
+
+  CheckingOpenTaskScheduledRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: CheckingOpenTaskEvent
+      # Ref: https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+      ScheduleExpression: cron(0 4 * * ? *) # This event will be sent everyday at 4AM UTC+0 => 5AM UTC+1
+      State: ENABLED
+      Targets: 
+        - Id: TargetFunction1
+          Arn: !GetAtt CheckingOpenTaskLambdaFunction.Arn
+        
+  PermissionForCheckingOpenTaskEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref CheckingOpenTaskLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CheckingOpenTaskScheduledRule.Arn
+  ApiImportOELProductHandler:
+    Description: Receive HTTP Requests and upsert product of OEL
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: dist/handlers/ImportOELProductHandlers.handler
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableOELData
+
+  # Nested stack for FmaStore web app 
+
+  InipPickerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: template-inip-picker.yml
+      Parameters:
+        MainStackName: !Sub "${AWS::StackName}"
+        loweredCaseStackName: !GetAtt LoweredCaseStackName.OutputString
+        RuntimeDependenciesLayerRef: !Ref RuntimeDependenciesLayer
+        TableState: !Ref TableState
+        TableLatestState: !Ref TableLatestState
+        TablePhotoStudioAssignments: !Ref TablePhotoStudioAssignments
+        TablePhotoStudios: !Ref TablePhotoStudios
+        TableBrands: !Ref TableBrands
+        TableConsumptionTheme: !Ref TableConsumptionTheme
+
+  # Nested stack for Avis scheduler
+
+  AvisScheduler:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: substacks/avis_scheduler.yml
+      Parameters:
+        MainStackName: !Sub "${AWS::StackName}"
+        Env: DEV
+        MailFrom: "wolfgang.middel.extern@galeria.de"
+        ReportMail: "quan.nguyen.extern@karstadt.de"
+        S3BucketName: !FindInMap [AvisSchdulerBucket, !Ref "AWS::StackName", bucketname]
+        EventCron: "cron(0 8 * * ? *)"
+
+Outputs:
+  NotificationEndpoint:
+    Description: "API Gateway endpoint URL for v1 stage [Notification API]"
+    Value: !If
+      - AddCustomDomain
+      - !Sub "https://${NotificationAPIWithDomain}.execute-api.${AWS::Region}.amazonaws.com/v1"
+      - !Sub "https://${NotificationAPI}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  WorkbenchEndpoint:
+    Description: "API Gateway endpoint URL for v1 stage [Workbench API]"
+    Value: !Sub "https://${WorkbenchAPI}.execute-api.${AWS::Region}.amazonaws.com/v1/"
+  WorkbenchImporterEndpoint:
+    Description: "API Gateway endpoint URL for v1 stage [Workbench Importer API]"
+    Value: !Sub "https://${WorkbenchImporterAPI}.execute-api.${AWS::Region}.amazonaws.com/v1/"
+  OELWorkbenchEndpoint:
+    Description: "API Gateway endpoint URL for v1 stage [OELWorkbench API]"
+    Value: !Sub "https://${OELWorkbenchAPI}.execute-api.${AWS::Region}.amazonaws.com/v1/"
+  WorkbenchPhotoStudioReceiptEndpoint:
+    Description: "API Gateway endpoint URL for v1 stage [Workbench PhotoStudioReceipt API]"
+    Value: !Sub "https://${WorkbenchPhotoStudioReceiptAPI}.execute-api.${AWS::Region}.amazonaws.com/v1/"
+  InipPickerWebAppUrl:
+    Description: "Endpoint URL for INIP-PICKER web app"
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerWebAppUrl]
+  WorkbenchInipPickerEndpoint:
+    Description: "API Gateway endpoint URL for v1 stage [Workbench Inip picker API]"
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerWorkbenchEndpoint]
+  InipPickerCognitoDomain:
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerCognitoDomain]
+  InipPickerCognitoUserPoolId:
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerCognitoUserPoolId]
+  InipPickerCognitoAppClientId:
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerCognitoAppClientId]
+  InipPickerCognitoLoginCallback:
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerCognitoLoginCallback]
+  InipPickerCognitoLogoutCallback:
+    Value: 
+      Fn::GetAtt: [InipPickerStack, Outputs.InipPickerCognitoLogoutCallback]

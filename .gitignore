@@ -1,0 +1,15 @@
+node_modules
+.aws-sam
+env.json
+.env
+.eslint-report.json
+dist/
+test-results
+samconfig.toml
+src/lib
+src/tables
+src/Cleaning/**/*.csv
+src/debug/**/*.csv
+src/debug/**/*.csv#
+shared-local-instance.db
+.DS_Store

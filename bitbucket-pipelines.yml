@@ -1,0 +1,224 @@
+# Check our guides at https://confluence.atlassian.com/x/14UWN for more examples.
+# Only use spaces to indent your .yml configuration.
+# -----
+# You can specify a custom docker image from Docker Hub as your build environment.
+image: sleavely/node-awscli:14.x
+
+options:
+    max-time: 5
+
+clone:
+    depth: full # SonarCloud scanner needs the full history to assign issues properly
+
+definitions:
+    caches:
+        sonar: ~/.sonar/cache # Caching SonarCloud artifacts will speed up your build
+        npm: ~/.npm # Caching npm
+    services:
+        docker:
+            memory: 2048
+        dynamodb-local:
+            image: amazon/dynamodb-local
+            memory: 1024
+    steps:
+    - step: &install
+        name: Install
+        caches:
+                - node
+        script:
+            - set -e
+            - cd "$BITBUCKET_CLONE_DIR"
+            - git submodule update --init # get all submodules
+            - npm ci # ci will strictly install according to package-lock.json
+            - npm run genAllApiFolders
+            - npm run genAllApi
+        artifacts:
+            - src/lib/**
+            - src/tables/**
+            - node_modules/@tsconfig/node14/tsconfig.json
+    - step: &lint
+        name: Lint
+        caches:
+            - node
+        script:
+            - set -e
+            - cd "$BITBUCKET_CLONE_DIR"
+            - npm ci # ci will strictly install according to package-lock.json
+            - npm run lint-ci
+        artifacts:
+            - eslint-report.json
+    - step: &build
+        name: Build
+        script:
+            - set -e
+            - cd "$BITBUCKET_CLONE_DIR"
+            - npm ci # ci will strictly install according to package-lock.json
+            - npm run build
+        artifacts:
+            - dist/**
+    - step: &test
+        name: Test
+        size: 2x
+        max-time: 20
+        caches:
+            - node
+        services:
+            - dynamodb-local
+        script:
+            - set -e
+            - cd "$BITBUCKET_CLONE_DIR"
+            - npm ci # ci will strictly install according to package-lock.json
+            - npm run setupdb
+            - npm run initdb
+            - npm test # run tests
+        artifacts:
+            - test-results/**
+    - step: &sonar-scan
+        name: Scan with SonarCloud
+        size: 2x
+        max-time: 10
+        services:
+          - docker
+        script:
+            - pipe: sonarsource/sonarcloud-scan:1.2.1
+              variables:
+
+                DEBUG: "true"
+    - step: &sonar-gate
+        name: SonarCloud Quality Gate
+        max-time: 6
+        script:
+            - pipe: sonarsource/sonarcloud-quality-gate:0.1.4
+              variables:
+                EXTRA_ARGS: '-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300'
+
+    - step: &sam-build
+        name: sam build
+        size: 2x
+        max-time: 40
+        # caches:
+        #     - node
+        script:
+            - mkdir -p /tmp/sam
+            - cd /tmp/sam
+            - curl -L -o aws-sam-cli-linux-x86_64.zip https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+            - unzip aws-sam-cli-linux-x86_64.zip -d sam-installation
+            - ./sam-installation/install
+            - cd "$BITBUCKET_CLONE_DIR"
+            - npm ci
+            - npm run sam-build
+        artifacts:
+            - .aws-sam/**
+
+pipelines:
+    pull-requests:
+        '**':
+            - step: *install
+            - parallel:
+                - step: *lint
+                - step: *build
+            - parallel:
+                - step: *test
+                - step: *sam-build
+            - step: *sonar-scan
+            - step: *sonar-gate
+            - step:
+                name: Dry-Run deployment
+                deployment: Development-dry-run
+                max-time: 20
+                caches:
+                  - node
+                script:
+                    - mkdir -p /tmp/sam
+                    - cd /tmp/sam
+                    - curl -L -o aws-sam-cli-linux-x86_64.zip https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+                    - unzip aws-sam-cli-linux-x86_64.zip -d sam-installation
+                    - ./sam-installation/install
+                    - cd "$BITBUCKET_CLONE_DIR"
+                    - npm run sam-deploy-dry
+
+    branches:
+    #     'master':
+    #         - step:
+    #               caches:
+    #                   - node
+    #               deployment: Production
+    #               script:
+    #                   - cd "$BITBUCKET_CLONE_DIR"
+    #                   - npm ci # ci will strictly install according to package-lock.json
+    #                   - exit 1; #
+        'develop':
+            - step: *install
+            - parallel:
+                - step: *lint
+                - step: *build
+            - parallel:
+                - step: *test
+                - step: *sam-build
+            - step: *sonar-scan
+            - step: *sonar-gate
+            - step:
+                name: "[DEV] Deploy to AWS"
+                deployment: Development
+                caches:
+                    - node
+                max-time: 20 # this can take longer on initial creation of the stack
+                script:
+                    - mkdir -p /tmp/sam
+                    - cd /tmp/sam
+                    - curl -L -o aws-sam-cli-linux-x86_64.zip https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+                    - unzip aws-sam-cli-linux-x86_64.zip -d sam-installation
+                    - ./sam-installation/install
+                    - cd "$BITBUCKET_CLONE_DIR"
+                    - ls -lah ./.aws-sam
+                    - ls -lah ./.aws-sam/build
+                    - npm run prune
+                    - npm run sam-deploy
+                    - |
+                      aws s3 sync ./ s3://inip-dev-avis-bucket/ --exclude "dist/*" --exclude ".aws-sam/*" --exclude "__tests__/*" --exclude ".git/*" --exclude "node_modules/*" --exclude "localdb/*" --exclude "test-results/*" --exclude "events/*" --exclude "statemachine/*" --delete
+            - step:
+                name: "[INT] Deploy to AWS"
+                deployment: Integration
+                caches:
+                    - node
+                max-time: 20 # this can take longer on initial creation of the stack
+                script:
+                    - mkdir -p /tmp/sam
+                    - cd /tmp/sam
+                    - curl -L -o aws-sam-cli-linux-x86_64.zip https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+                    - unzip aws-sam-cli-linux-x86_64.zip -d sam-installation
+                    - ./sam-installation/install
+                    - cd "$BITBUCKET_CLONE_DIR"
+                    - ls -lah ./.aws-sam
+                    - ls -lah ./.aws-sam/build
+                    - npm run prune
+                    - npm run sam-deploy
+                    - |
+                      aws s3 sync ./ s3://inip-int-avis-bucket/ --exclude "dist/*" --exclude ".aws-sam/*" --exclude "__tests__/*" --exclude ".git/*" --exclude "node_modules/*" --exclude "localdb/*" --exclude "test-results/*" --exclude "events/*" --exclude "statemachine/*" --delete
+        'main':
+            - step: *install
+            - parallel:
+                - step: *lint
+                - step: *build
+            - parallel:
+                - step: *test
+                - step: *sam-build
+            - step: *sonar-scan
+            - step: *sonar-gate
+            - step:
+                name: "[PRD] Deploy to AWS"
+                deployment: Production
+                caches:
+                    - node
+                max-time: 20 # this can take longer on initial creation of the stack
+                script:
+                    - mkdir -p /tmp/sam
+                    - cd /tmp/sam
+                    - curl -L -o aws-sam-cli-linux-x86_64.zip https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+                    - unzip aws-sam-cli-linux-x86_64.zip -d sam-installation
+                    - ./sam-installation/install
+                    - cd "$BITBUCKET_CLONE_DIR"
+                    - ls -lah ./.aws-sam
+                    - ls -lah ./.aws-sam/build
+                    - npm run prune
+                    - npm run sam-deploy

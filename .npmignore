@@ -1,0 +1,7 @@
+__tests__/
+.vscode/
+.aws-sam/
+src/
+test-results/
+
+env.json

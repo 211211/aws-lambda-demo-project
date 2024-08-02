@@ -1,0 +1,57 @@
+{
+    "Comment": "A state machine which will process all incoming messages",
+    "StartAt": "Start",
+    "States": {
+		"Start": {
+			"Type": "Pass",
+			"Next": "Aquire Mutex"
+		},
+
+		"Aquire Mutex": {
+			"Type": "Task",
+			"Resource": "arn:aws:states:::dynamodb:putItem",
+			"Parameters": {
+				"TableName": "StepFunction-124-Mutex",
+				"ConditionExpression": "attribute_not_exists(lockName)",
+				"Item": {
+					"lockName": "gtin-123",
+					"lockedBy.$": "$$.Execution.Id",
+					"timestamp.$": "$$.State.EnteredTime"
+				}
+			},
+			"Retry": [
+				{
+					"ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+					"IntervalSeconds": 10,
+					"BackoffRate": 2,
+					"MaxAttempts": 10
+				}
+			],
+			"ResultPath": null,
+			"Next": "Do Stuff"
+		},
+
+		"Do Stuff": {
+			"Type": "Wait",
+			"Seconds": 10,
+			"Next": "Release Mutex"
+		},
+
+		"Release Mutex": {
+			"Type": "Task",
+			"Resource": "arn:aws:states:::dynamodb:deleteItem",
+			"Parameters": {
+				"TableName": "StepFunction-124-Mutex",
+				"Key": {
+					"lockName": "gtin-123"
+				},
+				"ConditionExpression": "lockedBy = :execId",
+				"ExpressionAttributeValues": {
+					":execId": { "S.$": "$$.Execution.Id"}
+				}
+			},
+			"ResultPath": null,
+			"End": true
+		}
+	}
+}

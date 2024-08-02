@@ -1,0 +1,10 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "INIP-DEV-{{NAME-OF-DEVELOPER}}"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-NUMBERXXX"
+s3_prefix = "INIP-DEV-{{NAME-OF-DEVELOPER}}"
+region = "eu-central-1"
+confirm_changeset = true
+capabilities = ["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"]
